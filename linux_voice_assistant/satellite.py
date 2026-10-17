@@ -12,6 +12,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Set, Union
 from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen
+from .led_controller import LEDController
 
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
@@ -81,6 +82,7 @@ class VoiceSatelliteProtocol(APIServer):
         self.state = state
         self.state.satellite = self
         self.state.connected = False
+        self.led_controller = LEDController()
 
         # Report capabilities appropriately
         if state.output_only:

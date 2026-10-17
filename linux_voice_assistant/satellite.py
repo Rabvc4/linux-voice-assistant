@@ -25,6 +25,7 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     NumberCommandRequest,
     SelectCommandRequest,
     SubscribeHomeAssistantStatesRequest,
+    SubscribeStatesRequest,
     SwitchCommandRequest,
     VoiceAssistantAnnounceFinished,
     VoiceAssistantAnnounceRequest,
@@ -51,6 +52,7 @@ from pyopen_wakeword import OpenWakeWord
 from .api_server import APIServer
 from .entity import (
     ButtonEventSensorEntity,
+    ButtonLockEntity,
     LEDLightEntity,
     MediaPlayerEntity,
     MicSettingEntity,
@@ -334,6 +336,9 @@ class VoiceSatelliteProtocol(APIServer):
         # button support before this satellite was constructed (e.g. on an HA
         # reconnect while the peripheral container stayed connected to LVA).
         self.register_pending_button()
+        # Materialise ButtonLockEntity if a peripheral already registered
+        # the button-lock switch before this satellite was constructed.
+        self.register_pending_button_lock()
 
         # ---- Instance variables ----
 
@@ -430,6 +435,40 @@ class VoiceSatelliteProtocol(APIServer):
         self.state.button_event_sensor_entity = entity
         _LOGGER.info("Button event sensor entity materialised")
 
+    def register_pending_button_lock(self) -> None:
+        """Materialise the button-lock switch once a peripheral has registered it.
+
+        Called from __init__ (handles HA reconnects where the peripheral
+        container stayed connected to LVA and pending_button_lock is already
+        True) and from PeripheralAPIServer._register_button_lock() when the
+        command arrives at runtime.
+
+        Safe to call multiple times: idempotent — if the entity already
+        exists it is only reattached to the current satellite server
+        instance, preserving its current lock state.
+        """
+        if not self.state.pending_button_lock:
+            return
+
+        if self.state.button_lock_entity is not None:
+            self.state.button_lock_entity.server = self
+            if self.state.button_lock_entity not in self.state.entities:
+                self.state.entities.append(self.state.button_lock_entity)
+            return
+
+        entity = ButtonLockEntity(
+            server=self,
+            key=len(self.state.entities),
+            name="Disable button controls",
+            object_id="disable_button_controls",
+            get_locked=lambda: self.state.button_controls_locked,
+            set_locked=self._set_button_controls_locked,
+        )
+        self.state.entities.append(entity)
+        self.state.button_lock_entity = entity
+        entity.sync_with_state()
+        _LOGGER.info("Button lock switch entity materialised")
+
     def _on_led_light_changed(self, object_id: str) -> None:
         """Forward an HA Light entity change to peripherals as light_command.
 
@@ -440,6 +479,10 @@ class VoiceSatelliteProtocol(APIServer):
         if entity is None:
             return
         self._emit(LVAEvent.LIGHT_COMMAND, entity.state_dict())
+
+    def _on_button_lock_changed(self, is_locked: bool) -> None:
+        """Forward a button-lock switch change to peripherals as button_lock_changed."""
+        self._emit(LVAEvent.BUTTON_LOCK_CHANGED, {"locked": is_locked})
 
     # ------------------------------------------------------------------
     # Mute / thinking sound
@@ -455,6 +498,21 @@ class VoiceSatelliteProtocol(APIServer):
             _LOGGER.debug("Thinking sound disabled")
             pass
         self.state.save_preferences()
+
+    def _set_button_controls_locked(self, new_state: bool) -> None:
+        self.state.button_controls_locked = bool(new_state)
+        self.state.preferences.button_controls_locked = 1 if self.state.button_controls_locked else 0
+        self.state.save_preferences()
+
+        if self.state.button_controls_locked:
+            _LOGGER.debug("On-board button controls locked")
+        else:
+            _LOGGER.debug("On-board button controls unlocked")
+
+        if self.state.button_lock_entity is not None:
+            self.state.button_lock_entity.sync_with_state()
+
+        self._emit(LVAEvent.BUTTON_LOCK_CHANGED, {"locked": self.state.button_controls_locked})
 
     def _set_sensitivity_1(self, new_value: float) -> None:
         self.state.wake_word_1_threshold = float(new_value)
@@ -506,7 +564,7 @@ class VoiceSatelliteProtocol(APIServer):
     # ------------------------------------------------------------------
 
     def handle_voice_event(self, event_type: VoiceAssistantEventType, data: Dict[str, str]) -> None:
-        _LOGGER.debug("Voice event: type=%s, data=%s", event_type.name, data)
+        _LOGGER.info("Voice event: type=%s, data=%s", event_type.name, data)
 
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
             self._tts_url = data.get("url")
@@ -598,6 +656,12 @@ class VoiceSatelliteProtocol(APIServer):
             self._emit(LVAEvent.TIMER_UPDATED, timer_data)
 
         elif event_type == VoiceAssistantTimerEventType.VOICE_ASSISTANT_TIMER_CANCELLED:
+            # Report the cancel as a zeroed update before going idle. Every
+            # shipped peripheral already reads `seconds_left` from
+            # `timer_updated`, and none of them treats zero as "ringing",
+            # that is `timer_ringing`, so the countdown clears without any
+            # peripheral having to learn a new event.
+            self._emit(LVAEvent.TIMER_UPDATED, {**timer_data, "seconds_left": 0})
             self._emit(LVAEvent.IDLE)
 
         elif event_type == VoiceAssistantTimerEventType.VOICE_ASSISTANT_TIMER_FINISHED:
@@ -657,7 +721,12 @@ class VoiceSatelliteProtocol(APIServer):
                 model="Linux Voice Assistant",
                 voice_assistant_feature_flags=self.supported_features,
             )
-
+        elif isinstance(msg, SubscribeStatesRequest):
+            # Standard ESPHome state subscription. Replay current entity state to
+            # the subscribing client. (Entities answer SubscribeHomeAssistantStatesRequest;
+            # initial state was previously only sent as a side effect of auth.)
+            for entity in self.state.entities:
+                yield from entity.handle_message(SubscribeHomeAssistantStatesRequest())
         elif isinstance(
             msg,
             (ListEntitiesRequest, SubscribeHomeAssistantStatesRequest, MediaPlayerCommandRequest, SwitchCommandRequest, NumberCommandRequest, SelectCommandRequest, LightCommandRequest),
@@ -828,10 +897,25 @@ class VoiceSatelliteProtocol(APIServer):
         self._pipeline_active = True
         self._emit(LVAEvent.WAKE_WORD_DETECTED)
         self.duck()
-        self.state.tts_player.play(
-            self.state.wakeup_sound,
-            done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase),
+        if self.state.listen_during_wake_sound:
+            _LOGGER.debug("Starting audio streaming immediately (listen_during_wake_sound enabled)")
+            self.state.tts_player.play(self.state.wakeup_sound)
+            self._start_audio_streaming(wake_word_phrase)
+        else:
+            self.state.tts_player.play(
+                self.state.wakeup_sound,
+                done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase),
+            )
+
+    def _start_audio_streaming(self, wake_word_phrase: str) -> None:
+        """Start streaming audio during wake sound detection."""
+        _LOGGER.debug(
+            "Starting audio streaming for: %s",
+            wake_word_phrase,
         )
+        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
+        self._is_streaming_audio = True
+        self._emit(LVAEvent.LISTENING)
 
     def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
         """Callback invoked when the wakeup chime finishes; begin STT streaming."""
@@ -987,6 +1071,13 @@ class VoiceSatelliteProtocol(APIServer):
             ),
         )
 
+    def connection_made(self, transport) -> None:
+        super().connection_made(transport)
+        # Track every live connection so asynchronous entity-state changes can be
+        # broadcast to all of them (see ServerState.broadcast).
+        if self not in self.state.connections:
+            self.state.connections.append(self)
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -1002,19 +1093,29 @@ class VoiceSatelliteProtocol(APIServer):
         self._timer_finished = False
         self._pipeline_active = False
 
-        # Stop any ongoing audio playback and wake/stop word processing.
-        try:
-            self.state.music_player.stop()
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Failed to stop music player during disconnect")
+        # Deregister this connection.
+        if self in self.state.connections:
+            self.state.connections.remove(self)
 
-        try:
-            self.state.tts_player.stop()
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Failed to stop TTS player during disconnect")
+        # Only tear down shared playback/state when the LAST client disconnects.
+        # Otherwise a secondary client (a diagnostic tool, a second dashboard, or
+        # Home Assistant's own overlapping reconnect) dropping would stop audio
+        # that belongs to a client still connected.
+        if not self.state.connections:
+            # Stop any ongoing audio playback and wake/stop word processing.
+            try:
+                self.state.music_player.stop()
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Failed to stop music player during disconnect")
 
-        self.state.stop_word.is_active = False  # type: ignore[attr-defined]
-        self.state.connected = False
+            try:
+                self.state.tts_player.stop()
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Failed to stop TTS player during disconnect")
+
+            self.state.stop_word.is_active = False  # type: ignore[attr-defined]
+            self.state.connected = False
+
         if self.state.satellite is self:
             self.state.satellite = None
 

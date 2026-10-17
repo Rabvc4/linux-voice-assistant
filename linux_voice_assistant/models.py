@@ -2,6 +2,7 @@
 
 import json
 import logging
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -9,11 +10,13 @@ from queue import Queue
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 if TYPE_CHECKING:
+    from google.protobuf import message
     from pymicro_wakeword import MicroWakeWord
     from pyopen_wakeword import OpenWakeWord
 
     from .entity import (
         ButtonEventSensorEntity,
+        ButtonLockEntity,
         ESPHomeEntity,
         LEDLightEntity,
         MediaPlayerEntity,
@@ -83,6 +86,7 @@ class Preferences:
     active_wake_words: List[Optional[str]] = field(default_factory=list)
     volume: Optional[float] = None
     thinking_sound: int = 0  # 0 = disabled, 1 = enabled
+    button_controls_locked: int = 0  # 0 = buttons enabled (default), 1 = buttons locked
     wake_word_1_sensitivity: Optional[float] = None
     wake_word_2_sensitivity: Optional[float] = None
     stop_word_sensitivity: Optional[float] = None
@@ -125,6 +129,7 @@ class ServerState:
 
     media_player_entity: "Optional[MediaPlayerEntity]" = None
     satellite: "Optional[VoiceSatelliteProtocol]" = None
+    connections: "List[VoiceSatelliteProtocol]" = field(default_factory=list)
     mute_switch_entity: "Optional[MuteSwitchEntity]" = None
     thinking_sound_entity: "Optional[ThinkingSoundEntity]" = None
     button_event_sensor_entity: "Optional[ButtonEventSensorEntity]" = None
@@ -143,6 +148,13 @@ class ServerState:
     # Survives HA reconnects so the entity is re-registered automatically.
     pending_button: bool = False
 
+    # True once a peripheral sends register_button_lock. Gates creation of
+    # ButtonLockEntity so the HA device page only shows the "Disable button
+    # controls" switch when hardware that actually supports it is present.
+    # Survives HA reconnects so the entity is re-registered automatically.
+    pending_button_lock: bool = False
+    button_lock_entity: "Optional[ButtonLockEntity]" = None
+
     # Optional peripheral WebSocket API (LEDs, buttons, HAT boards).
     # Assigned in __main__ before the event loop starts.
     peripheral_api: "Optional[Any]" = None  # PeripheralAPIServer at runtime
@@ -156,6 +168,7 @@ class ServerState:
     wake_words_changed: bool = False
     refractory_seconds: float = 2.0
     thinking_sound_enabled: bool = False
+    button_controls_locked: bool = False
     output_only: bool = False
     muted: bool = False
     connected: bool = False
@@ -171,6 +184,22 @@ class ServerState:
     mic_volume: int = 100  # 1–100, default maximum
     audio_input_channels: int = 2  # number of mic channels to stream
     timer_max_ring_seconds: float = 900.0
+    listen_during_wake_sound: bool = False
+
+    def broadcast(self, msgs: "Iterable[message.Message]") -> None:
+        """Send messages to every connected API client.
+
+        Entity state changes that happen asynchronously (not in response to a
+        request) must reach *all* subscribed clients, not just whichever
+        connection happens to be referenced by an entity's ``server``. Without
+        this fan-out a second API client leaves Home Assistant stuck on a stale
+        state (e.g. ``playing`` after playback has finished).
+        """
+        messages = list(msgs)
+        if not messages:
+            return
+        for connection in list(self.connections):
+            connection.send_messages(messages)
 
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
@@ -198,6 +227,7 @@ class ServerState:
             _LOGGER.debug("Skipping save - volume unchanged")
             return
 
+        previous_muted = self.volume == 0.0
         self.volume = clamped_volume
         self.preferences.volume = clamped_volume
         _LOGGER.info("Saving volume %s to %s", clamped_volume, self.preferences_path)
@@ -210,6 +240,10 @@ class ServerState:
             from .peripheral_api import LVAEvent  # local import avoids circular dep
 
             api.emit_event_sync(LVAEvent.VOLUME_CHANGED, {"volume": round(clamped_volume, 3)})
+
+            new_muted = clamped_volume == 0.0
+            if previous_muted != new_muted:
+                api.emit_event_sync(LVAEvent.VOLUME_MUTED, {"muted": new_muted})
 
     def persist_mic_gain(self, gain: float) -> None:
         """Persist the microphone auto gain value."""
@@ -241,3 +275,14 @@ class ServerState:
         self.preferences.mic_volume = volume_int
         _LOGGER.info("Saving mic_volume %s to %s", volume_int, self.preferences_path)
         self.save_preferences()
+
+
+def initial_stop_word_threshold(saved_sensitivity: Optional[float]) -> float:
+    """
+    Resolve the stop word probability cutoff to start from, clamped to 0.0-1.0.
+    :param saved_sensitivity: Value persisted in preferences, or None if it has never been set.
+    """
+    if saved_sensitivity is None:
+        return ServerState.stop_word_threshold
+
+    return max(0.0, min(1.0, float(saved_sensitivity)))

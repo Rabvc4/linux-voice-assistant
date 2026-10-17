@@ -1,5 +1,6 @@
 import logging
 import struct
+import threading
 
 import usb.core
 import usb.util
@@ -64,27 +65,55 @@ class LEDController:
         # Color format: 0xRRGGBB
         self._write_uint32(LED_COLOR, color)
 
+# Map for effects 
     def off(self) -> None:
         self._set_effect(0)
 
-    def idle(self) -> None:
-        self.off()
-
-    def listening(self) -> None:
-        self._set_color(0x0088FF)
-        self._set_brightness(128)
-        self._set_effect(3)
-
-    def thinking(self) -> None:
-        self._set_color(0xFF8800)
-        self._set_brightness(180)
-        self._set_speed(1)
+    def breath(self) -> None:
         self._set_effect(1)
 
-    def speaking(self) -> None:
-        self._set_color(0x00FF88)
-        self._set_brightness(160)
+    def rainbow(self) -> None:
+        self._set_effect(2)
+
+    def solid(self) -> None:
         self._set_effect(3)
 
     def doa(self) -> None:
         self._set_effect(4)
+
+# Funtions
+    def idle(self) -> None:
+        self.off()
+
+    def listening(self) -> None:
+        self.doa()      
+
+    def thinking(self) -> None:
+        self._set_color(0xFF8800)
+        self._set_brightness(120)
+        self._set_speed(1)
+        self.breath()
+
+    def speaking(self) -> None:
+        self._set_color(0x00FF88)
+        self._set_brightness(160)
+        self._set_speed(1)
+        self.breath()
+
+    def disconnected(self) -> None:
+        self._set_color(0x780116)
+        self._set_brightness(50)
+        self._set_speed(1)
+        self.breath()
+
+    def reconnected(self) -> None:
+        self._set_color(0x00FF00)
+        self._set_brightness(100)
+        self.solid()
+    
+        threading.Timer(0.5, self.idle).start()
+
+    def error(self) -> None:
+        self._set_color(0x780116)
+        self._set_brightness(100)
+        self.solid()

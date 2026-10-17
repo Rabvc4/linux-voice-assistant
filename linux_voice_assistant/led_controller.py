@@ -95,7 +95,7 @@ class LEDController:
         self.breath()
 
     def speaking(self) -> None:
-        self._set_color(0x00FF88)
+        self._set_color(0xFDE74C)
         self._set_brightness(160)
         self._set_speed(1)
         self.breath()

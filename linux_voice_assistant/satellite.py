@@ -575,6 +575,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._pipeline_active = True
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_START:
+            self.led_controller.thinking()
             self._emit(LVAEvent.THINKING)
             # Play optional audible thinking sound
             if self.state.thinking_sound_enabled:
@@ -594,6 +595,7 @@ class VoiceSatelliteProtocol(APIServer):
             if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_END:
                 stt_text = data.get("text", "").strip()
                 if stt_text:
+                    self.led_controller.speaking()
                     self._emit(LVAEvent.STT_TEXT, {"text": stt_text})
                     _LOGGER.debug("STT transcript: %s", stt_text)
 
@@ -609,6 +611,7 @@ class VoiceSatelliteProtocol(APIServer):
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_START:
             tts_text = data.get("text", "").strip()
             if tts_text:
+                self.led_controller.speaking()
                 self._emit(LVAEvent.TTS_TEXT, {"text": tts_text})
                 _LOGGER.debug("TTS response text: %s", tts_text)
 
@@ -628,6 +631,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_ERROR:
+            self.led_controller.error()
             self._emit(LVAEvent.PIPELINE_ERROR)
 
     # ------------------------------------------------------------------
@@ -672,6 +676,7 @@ class VoiceSatelliteProtocol(APIServer):
                 self._timer_finished = True
                 self._timer_ring_start = time.monotonic()
                 self.duck()
+                self.led_controller.rainbow()
                 self._emit(LVAEvent.TIMER_RINGING, timer_data)
                 self._play_timer_finished()
 
@@ -702,6 +707,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._continue_conversation = msg.start_conversation
 
             self.duck()
+            self.led_controller.speaking()
             self._emit(LVAEvent.TTS_SPEAKING)
             self.state.tts_player.play(urls, done_callback=self._tts_finished)
 
@@ -748,6 +754,7 @@ class VoiceSatelliteProtocol(APIServer):
                 yield ListEntitiesDoneResponse()
 
         elif isinstance(msg, VoiceAssistantConfigurationRequest):
+            self.led_controller.reconnected()
             _LOGGER.debug("✅ Received VoiceAssistantConfigurationRequest from Home Assistant")
             _LOGGER.debug("   -> Request contains %d external wake words", len(msg.external_wake_words))
 
@@ -794,6 +801,7 @@ class VoiceSatelliteProtocol(APIServer):
                 max_active_wake_words=2,
             )
 
+            self.led_controller.reconnected()
             _LOGGER.info("✅ Connected to Home Assistant - Configuration handshake completed")
             _LOGGER.debug("✅ VoiceAssistantConfigurationResponse sent successfully")
         elif isinstance(msg, VoiceAssistantSetConfiguration):
@@ -917,6 +925,7 @@ class VoiceSatelliteProtocol(APIServer):
         )
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
         self._is_streaming_audio = True
+        self.led_controller.listening()
         self._emit(LVAEvent.LISTENING)
 
     def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
@@ -927,6 +936,7 @@ class VoiceSatelliteProtocol(APIServer):
         )
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
         self._is_streaming_audio = True
+        self.led_controller.listening()
         self._emit(LVAEvent.LISTENING)
 
     def start_listening(self) -> None:
@@ -961,6 +971,7 @@ class VoiceSatelliteProtocol(APIServer):
         _LOGGER.debug("Start-listening sound finished, starting audio streaming")
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase="")])
         self._is_streaming_audio = True
+        self.led_controller.listening()
         self._emit(LVAEvent.LISTENING)
 
     def stop(self) -> None:
@@ -972,6 +983,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._timer_ring_start = None
             self.unduck()
             self.state.tts_player.stop()
+            self.led_controller.idle()
             self._emit(LVAEvent.IDLE)
             _LOGGER.debug("Stopping timer finished sound")
         else:
@@ -992,6 +1004,7 @@ class VoiceSatelliteProtocol(APIServer):
         _LOGGER.debug("Playing TTS response: %s", self._tts_url)
 
         self.state.active_wake_words.add(self.state.stop_word.id)
+        self.led_controller.speaking()
         self._emit(LVAEvent.TTS_SPEAKING)
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
 
@@ -1006,6 +1019,7 @@ class VoiceSatelliteProtocol(APIServer):
             # Keep pipeline active during the settle delay so the mic stays closed
             # and does not capture the tail end of the TTS audio from the speaker.
             self._pipeline_active = True
+            self.led_controller.listening()
             self._emit(LVAEvent.LISTENING)
             _LOGGER.debug("Continuing conversation after %.2fs settle delay", self.state.continue_conversation_delay)
 
@@ -1023,6 +1037,7 @@ class VoiceSatelliteProtocol(APIServer):
         else:
             self._continue_conversation = False
             self.unduck()
+            self.led_controller.idle()
             self._emit(LVAEvent.IDLE)
 
         _LOGGER.debug("TTS response finished")
@@ -1134,6 +1149,7 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.mic_volume_entity.sync_with_state()
 
         # Notify peripheral container that HA is no longer reachable
+        self.led_controller.disconnected()
         self._emit(LVAEvent.DISCONNECTED)
 
         _LOGGER.info("Disconnected from Home Assistant; waiting for reconnection")
